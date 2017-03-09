@@ -1,7 +1,7 @@
-﻿#---------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License. See License.txt in the project root for license information.
-#---------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------
 #pylint: disable=line-too-long
 from azure.cli.core.commands import CliArgumentType
 from azure.cli.core.commands import register_cli_argument
@@ -34,6 +34,9 @@ register_cli_argument('ad sp create', 'identifier', options_list=('--id',), help
 register_cli_argument('ad sp create-for-rbac', 'name', name_arg_type)
 register_cli_argument('ad sp create-for-rbac', 'years', type=int)
 register_cli_argument('ad sp create-for-rbac', 'scopes', nargs='+')
+register_cli_argument('ad sp create-for-rbac', 'role', completer=get_role_definition_name_completion_list)
+register_cli_argument('ad sp create-for-rbac', 'skip_assignment', action='store_true', help='do not create default assignment')
+register_cli_argument('ad sp create-for-rbac', 'expanded_view', action='store_true', help='Once created, display more information like subscription and cloud environments')
 register_cli_argument('ad sp reset-credentials', 'name', name_arg_type)
 register_cli_argument('ad sp reset-credentials', 'years', type=int)
 
@@ -60,7 +63,7 @@ register_cli_argument('role definition', 'role_definition_id', options_list=('--
 register_cli_argument('role', 'resource_group_name', options_list=('--resource-group', '-g'),
                       help='use it only if the role or assignment was added at the level of a resource group')
 register_cli_argument('role definition', 'custom_role_only', action='store_true', help='custom roles only(vs. build-in ones)')
-register_cli_argument('role definition', 'role_definition', help="json formatted content which defines the new role. run 'show-create-template' to get samples")
+register_cli_argument('role definition', 'role_definition', help="json formatted content which defines the new role.")
 register_cli_argument('role definition update', 'name', arg_type=name_arg_type, completer=get_role_definition_name_completion_list, help="the role's logical name")
 
 

@@ -1,7 +1,7 @@
-﻿#---------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License. See License.txt in the project root for license information.
-#---------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------
 
 # pylint: disable=too-few-public-methods,no-self-use,too-many-arguments
 
@@ -10,57 +10,26 @@ import json
 import os
 import uuid
 
-from msrestazure.azure_exceptions import CloudError
 from azure.mgmt.resource.resources import ResourceManagementClient
 from azure.mgmt.resource.resources.models.resource_group import ResourceGroup
 from azure.mgmt.resource.resources.models import GenericResource
 
 from azure.mgmt.resource.policy.models import (PolicyAssignment, PolicyDefinition)
+from azure.mgmt.resource.locks.models import ManagementLockObject
+from azure.mgmt.resource.links.models import ResourceLinkProperties
 
 from azure.cli.core.parser import IncorrectUsageError
 from azure.cli.core._util import CLIError, get_file_json
-import azure.cli.core._logging as _logging
+import azure.cli.core.azlogging as azlogging
 from azure.cli.core.commands.client_factory import get_mgmt_service_client
 from azure.cli.core.commands.arm import is_valid_resource_id, parse_resource_id
 
-from ._factory import _resource_client_factory, _resource_policy_client_factory
+from ._client_factory import (_resource_client_factory,
+                              _resource_policy_client_factory,
+                              _resource_lock_client_factory,
+                              _resource_links_client_factory)
 
-logger = _logging.get_az_logger(__name__)
-
-def _list_resources_odata_filter_builder(location=None, resource_type=None,
-                                         resource_group_name=None, tag=None, name=None):
-    '''Build up OData filter string from parameters
-    '''
-
-    filters = []
-
-    if resource_group_name:
-        filters.append("resourceGroup eq '{}'".format(resource_group_name))
-
-    if name:
-        filters.append("name eq '{}'".format(name))
-
-    if location:
-        filters.append("location eq '{}'".format(location))
-
-    if resource_type:
-        filters.append("resourceType eq '{}/{}'".format(
-            resource_type.namespace, resource_type.type))
-
-    if tag:
-        if name or location:
-            raise IncorrectUsageError('you cannot use the tag filter with other filters')
-
-        tag_name = list(tag.keys())[0] if isinstance(tag, dict) else tag
-        tag_value = tag[tag_name] if isinstance(tag, dict) else ''
-        if tag_name:
-            if tag_name[-1] == '*':
-                filters.append("startswith(tagname, '%s')" % tag_name[0:-1])
-            else:
-                filters.append("tagname eq '%s'" % tag_name)
-                if tag_value != '':
-                    filters.append("tagvalue eq '%s'" % tag_value)
-    return ' and '.join(filters)
+logger = azlogging.get_az_logger(__name__)
 
 def list_resource_groups(tag=None): # pylint: disable=no-self-use
     ''' List resource groups, optionally filtered by a tag.
@@ -83,12 +52,10 @@ def create_resource_group(resource_group_name, location, tags=None):
     ''' Create a new resource group.
     :param str resource_group_name:the desired resource group name
     :param str location:the resource group location
-    :param str tags:tags in 'a=b;c' format
+    :param str tags:tags in 'a=b c' format
     '''
     rcf = _resource_client_factory()
 
-    if rcf.resource_groups.check_existence(resource_group_name):
-        raise CLIError('resource group {} already exists'.format(resource_group_name))
     parameters = ResourceGroup(
         location=location,
         tags=tags
@@ -124,32 +91,11 @@ def export_group_as_template(
 
     print(json.dumps(result.template, indent=2))
 
-def list_resources(
-        location=None, resource_type=None, resource_group_name=None, tag=None, name=None):
-    ''' List resources
-        EXAMPLES:
-            az resource list --location westus
-            az resource list --name thename
-            az resource list --name thename --location westus
-            az resource list --tag something
-            az resource list --tag some*
-            az resource list --tag something=else
-        :param str location:filter by resource location
-        :param str resource_type:filter by resource type
-        :param str tag:filter by tag in 'a=b;c' format
-        :param str name:filter by resource name
-    '''
-    rcf = _resource_client_factory()
-    odata_filter = _list_resources_odata_filter_builder(
-        location, resource_type, resource_group_name, tag, name)
-    resources = rcf.resources.list(filter=odata_filter)
-    return list(resources)
-
 def deploy_arm_template(
         resource_group_name, template_file=None, template_uri=None, deployment_name=None,
-        parameters=None, mode='incremental'):
+        parameters=None, mode='incremental', no_wait=False):
     return _deploy_arm_template_core(resource_group_name, template_file, template_uri,
-                                     deployment_name, parameters, mode)
+                                     deployment_name, parameters, mode, no_wait=no_wait)
 
 def validate_arm_template(resource_group_name, template_file=None, template_uri=None,
                           parameters=None, mode='incremental'):
@@ -158,7 +104,7 @@ def validate_arm_template(resource_group_name, template_file=None, template_uri=
 
 def _deploy_arm_template_core(resource_group_name, template_file=None, template_uri=None,
                               deployment_name=None, parameters=None, mode='incremental',
-                              validate_only=False):
+                              validate_only=False, no_wait=False):
     from azure.mgmt.resource.resources.models import DeploymentProperties, TemplateLink
 
     if bool(template_uri) == bool(template_file):
@@ -181,9 +127,11 @@ def _deploy_arm_template_core(resource_group_name, template_file=None, template_
 
     smc = get_mgmt_service_client(ResourceManagementClient)
     if validate_only:
-        return smc.deployments.validate(resource_group_name, deployment_name, properties)
+        return smc.deployments.validate(resource_group_name, deployment_name,
+                                        properties, raw=no_wait)
     else:
-        return smc.deployments.create_or_update(resource_group_name, deployment_name, properties)
+        return smc.deployments.create_or_update(resource_group_name, deployment_name,
+                                                properties, raw=no_wait)
 
 
 def export_deployment_as_template(resource_group_name, deployment_name):
@@ -191,42 +139,88 @@ def export_deployment_as_template(resource_group_name, deployment_name):
     result = smc.deployments.export_template(resource_group_name, deployment_name)
     print(json.dumps(result.template, indent=2))#pylint: disable=no-member
 
-def tag_resource(
-        resource_group_name, resource_name, resource_type, tags, parent_resource_path=None,
-        api_version=None, resource_provider_namespace=None):
+def show_resource(resource_group_name=None, resource_provider_namespace=None,
+                  parent_resource_path=None, resource_type=None, resource_name=None,
+                  resource_id=None, api_version=None):
+    res = _ResourceUtils(resource_group_name, resource_provider_namespace,
+                         parent_resource_path, resource_type, resource_name,
+                         resource_id, api_version)
+    return res.get_resource()
+
+def delete_resource(resource_group_name=None, resource_provider_namespace=None,
+                    parent_resource_path=None, resource_type=None, resource_name=None,
+                    resource_id=None, api_version=None):
+    res = _ResourceUtils(resource_group_name, resource_provider_namespace,
+                         parent_resource_path, resource_type, resource_name,
+                         resource_id, api_version)
+    return res.delete()
+
+def tag_resource(tags, resource_group_name=None, resource_provider_namespace=None,
+                 parent_resource_path=None, resource_type=None, resource_name=None,
+                 resource_id=None, api_version=None):
     ''' Updates the tags on an existing resource. To clear tags, specify the --tag option
     without anything else. '''
+    res = _ResourceUtils(resource_group_name, resource_provider_namespace,
+                         parent_resource_path, resource_type, resource_name,
+                         resource_id, api_version)
+    return res.tag(tags)
+
+def get_deployment_operations(client, resource_group_name, deployment_name, operation_ids):
+    """get a deployment's operation.
+    """
+    result = []
+    for op_id in operation_ids:
+        dep = client.get(resource_group_name, deployment_name, op_id)
+        result.append(dep)
+    return result
+
+def list_resources(resource_group_name=None, resource_provider_namespace=None,
+                   resource_type=None, name=None, tag=None, location=None):
     rcf = _resource_client_factory()
-    resource = rcf.resources.get(
-        resource_group_name,
-        resource_provider_namespace,
-        parent_resource_path,
-        resource_type,
-        resource_name,
-        api_version)
-    # pylint: disable=no-member
-    parameters = GenericResource(
-        location=resource.location,
-        tags=tags,
-        plan=resource.plan,
-        properties=resource.properties,
-        kind=resource.kind,
-        managed_by=resource.managed_by,
-        sku=resource.sku,
-        identity=resource.identity)
-    try:
-        rcf.resources.create_or_update(
-            resource_group_name,
-            resource_provider_namespace,
-            parent_resource_path,
-            resource_type,
-            resource_name,
-            api_version,
-            parameters)
-    except CloudError as ex:
-        # TODO: Remove workaround once Swagger and SDK fix is implemented (#120123723)
-        if '202' not in str(ex):
-            raise ex
+    odata_filter = _list_resources_odata_filter_builder(resource_group_name,
+                                                        resource_provider_namespace,
+                                                        resource_type, name, tag, location)
+    resources = rcf.resources.list(filter=odata_filter)
+    return list(resources)
+
+def _list_resources_odata_filter_builder(resource_group_name=None,
+                                         resource_provider_namespace=None, resource_type=None,
+                                         name=None, tag=None, location=None):
+    '''Build up OData filter string from parameters
+    '''
+    filters = []
+
+    if resource_group_name:
+        filters.append("resourceGroup eq '{}'".format(resource_group_name))
+
+    if name:
+        filters.append("name eq '{}'".format(name))
+
+    if location:
+        filters.append("location eq '{}'".format(location))
+
+    if resource_type:
+        if resource_provider_namespace:
+            f = "'{}/{}'".format(resource_provider_namespace, resource_type)
+        else:
+            #assume resource_type is <namespace>/<type>. The worst is to get a server error
+            f = "'{}'".format(resource_type)
+        filters.append("resourceType eq " + f)
+
+    if tag:
+        if name or location:
+            raise IncorrectUsageError('you cannot use the tag filter with other filters')
+
+        tag_name = list(tag.keys())[0] if isinstance(tag, dict) else tag
+        tag_value = tag[tag_name] if isinstance(tag, dict) else ''
+        if tag_name:
+            if tag_name[-1] == '*':
+                filters.append("startswith(tagname, '%s')" % tag_name[0:-1])
+            else:
+                filters.append("tagname eq '%s'" % tag_name)
+                if tag_value != '':
+                    filters.append("tagvalue eq '%s'" % tag_value)
+    return ' and '.join(filters)
 
 def get_providers_completion_list(prefix, **kwargs): #pylint: disable=unused-argument
     rcf = _resource_client_factory()
@@ -409,3 +403,276 @@ def get_policy_assignment_completion_list(prefix, **kwargs):#pylint: disable=unu
     result = policy_client.policy_assignments.list()
     return [i.name for i in result]
 
+def list_locks(resource_group_name=None, resource_provider_namespace=None,
+               parent_resource_path=None, resource_type=None, resource_name=None,
+               filter_string=None):
+    '''
+    :param resource_provider_namespace: Name of a resource provider.
+    :type resource_provider_namespace: str
+    :param parent_resource_path: Path to a parent resource
+    :type parent_resource_path: str
+    :param resource_type: The type for the resource with the lock.
+    :type resource_type: str
+    :param resource_name: Name of a resource that has a lock.
+    :type resource_name: str
+    :param filter_string: A query filter to use to restrict the results.
+    :type filter_string: str
+    '''
+    lock_client = _resource_lock_client_factory()
+    if resource_group_name is None:
+        return lock_client.management_locks.list_at_subscription_level(filter=filter_string)
+    if resource_name is None:
+        return lock_client.management_locks.list_at_resource_group_level(
+            resource_group_name, filter=filter_string)
+    if resource_provider_namespace is None:
+        raise CLIError('--resource-provider-namespace is required if --resource-name is present')
+    if resource_type is None:
+        raise CLIError('--resource-type is required if --resource-name is present')
+    return lock_client.management_locks.list_at_resource_level(
+        resource_group_name, resource_provider_namespace, parent_resource_path, resource_type,
+        resource_name, filter=filter_string)
+
+def get_lock(name, resource_group_name=None):
+    '''
+    :param name: Name of the lock.
+    :type name: str
+    '''
+    lock_client = _resource_lock_client_factory()
+    if resource_group_name is None:
+        return lock_client.management_locks.get(name)
+    return lock_client.management_locks.get_at_resource_group_level(resource_group_name, name)
+
+def delete_lock(name, resource_group_name=None, resource_provider_namespace=None,
+                parent_resource_path=None, resource_type=None, resource_name=None):
+    '''
+    :param name: The name of the lock.
+    :type name: str
+    :param resource_provider_namespace: Name of a resource provider.
+    :type resource_provider_namespace: str
+    :param parent_resource_path: Path to a parent resource
+    :type parent_resource_path: str
+    :param resource_type: The type for the resource with the lock.
+    :type resource_type: str
+    :param resource_name: Name of a resource that has a lock.
+    :type resource_name: str
+    '''
+    lock_client = _resource_lock_client_factory()
+    if resource_group_name is None:
+        return lock_client.management_locks.delete_at_subscription_level(name)
+    if resource_name is None:
+        return lock_client.management_locks.delete_at_resource_group_level(
+            resource_group_name, name)
+    if resource_provider_namespace is None:
+        raise CLIError('--resource-provider-namespace is required if --resource-name is present')
+    if resource_type is None:
+        raise CLIError('--resource-type is required if --resource-name is present')
+    return lock_client.management_locks.delete_at_resource_level(
+        resource_group_name, resource_provider_namespace, parent_resource_path, resource_type,
+        resource_name, name)
+
+def create_lock(name, resource_group_name=None, resource_provider_namespace=None,
+                parent_resource_path=None, resource_type=None, resource_name=None,
+                level=None, notes=None, lock_id=None, lock_type=None):
+    parameters = ManagementLockObject(
+        level=level, notes=notes, id=lock_id, type=lock_type, name=name)
+    lock_client = _resource_lock_client_factory()
+    if resource_group_name is None:
+        return lock_client.management_locks.create_or_update_at_subscription_level(name, parameters)
+    if resource_name is None:
+        return lock_client.management_locks.create_or_update_at_resource_group_level(
+            resource_group_name, name, parameters)
+    if resource_provider_namespace is None:
+        raise CLIError('--resource-provider-namespace is required if --resource-name is present')
+    if resource_type is None:
+        raise CLIError('--resource-type is required if --resource-name is present')
+    return lock_client.management_locks.create_or_update_at_resource_level(
+        resource_group_name, resource_provider_namespace, parent_resource_path, resource_type,
+        resource_name, name, parameters)
+
+def _update_lock_parameters(parameters, level, notes, lock_id, lock_type):
+    if level is not None:
+        parameters.level = level
+    if notes is not None:
+        parameters.nodes = notes
+    if lock_id is not None:
+        parameters.id = lock_id
+    if lock_type is not None:
+        parameters.type = lock_type
+
+def update_lock(name, resource_group_name=None,
+                level=None, notes=None, lock_id=None, lock_type=None):
+    lock_client = _resource_lock_client_factory()
+    if resource_group_name is None:
+        params = lock_client.management_locks.get(name)
+        _update_lock_parameters(params, level, notes, lock_id, lock_type)
+        return lock_client.management_locks.create_or_update_at_subscription_level(name, params)
+    params = lock_client.management_locks.get_at_resource_group_level(resource_group_name, name)
+    _update_lock_parameters(params, level, notes, lock_id, lock_type)
+    return lock_client.management_locks.create_or_update_at_resource_group_level(
+        resource_group_name, name, params)
+
+def create_resource_link(link_id, target_id, notes=None):
+    '''
+    :param target_id: The id of the resource link target.
+    :type target_id: str
+    :param notes: Notes for this link.
+    :type notes: str
+    '''
+    links_client = _resource_links_client_factory().resource_links
+    properties = ResourceLinkProperties(target_id, notes)
+    links_client.create_or_update(link_id, properties)
+
+def update_resource_link(link_id, target_id=None, notes=None):
+    '''
+    :param target_id: The id of the resource link target.
+    :type target_id: str
+    :param notes: Notes for this link.
+    :type notes: str
+    '''
+    links_client = _resource_links_client_factory().resource_links
+    params = links_client.get(link_id)
+    properties = ResourceLinkProperties(
+        target_id if target_id is not None else params.properties.target_id, #pylint: disable=no-member
+        notes=notes if notes is not None else params.properties.notes) #pylint: disable=no-member
+    links_client.create_or_update(link_id, properties)
+
+def list_resource_links(scope=None, filter_string=None):
+    '''
+    :param scope: The scope for the links
+    :type scope: str
+    :param filter_string: A filter for restricting the results
+    :type filter_string: str
+    '''
+    links_client = _resource_links_client_factory().resource_links
+    if scope is not None:
+        return links_client.list_at_source_scope(scope, filter=filter_string)
+    return links_client.list_at_subscription(filter=filter_string)
+
+def _validate_resource_inputs(resource_group_name, resource_provider_namespace,
+                              resource_type, resource_name):
+    if resource_group_name is None:
+        raise CLIError('--resource-group/-g is required.')
+    if resource_type is None:
+        raise CLIError('--resource-type is required')
+    if resource_name is None:
+        raise CLIError('--name/-n is required')
+    if resource_provider_namespace is None:
+        raise CLIError('--namespace is required')
+
+class _ResourceUtils(object): #pylint: disable=too-many-instance-attributes
+    def __init__(self, resource_group_name=None, resource_provider_namespace=None,
+                 parent_resource_path=None, resource_type=None, resource_name=None,
+                 resource_id=None, api_version=None, rcf=None):
+        #if the resouce_type is in format 'namespace/type' split it.
+        #(we don't have to do this, but commands like 'vm show' returns such values)
+        if resource_type and not resource_provider_namespace and not parent_resource_path:
+            parts = resource_type.split('/')
+            if len(parts) > 1:
+                resource_provider_namespace = parts[0]
+                resource_type = parts[1]
+
+        self.rcf = rcf or _resource_client_factory()
+        if api_version is None:
+            if resource_id:
+                api_version = _ResourceUtils._resolve_api_version_by_id(self.rcf, resource_id)
+            else:
+                _validate_resource_inputs(resource_group_name, resource_provider_namespace,
+                                          resource_type, resource_name)
+                api_version = _ResourceUtils._resolve_api_version(self.rcf,
+                                                                  resource_provider_namespace,
+                                                                  parent_resource_path,
+                                                                  resource_type)
+
+        self.resource_group_name = resource_group_name
+        self.resource_provider_namespace = resource_provider_namespace
+        self.parent_resource_path = parent_resource_path
+        self.resource_type = resource_type
+        self.resource_name = resource_name
+        self.resource_id = resource_id
+        self.api_version = api_version
+
+    def get_resource(self):
+        if self.resource_id:
+            resource = self.rcf.resources.get_by_id(self.resource_id, self.api_version)
+        else:
+            resource = self.rcf.resources.get(self.resource_group_name,
+                                              self.resource_provider_namespace,
+                                              self.parent_resource_path or '',
+                                              self.resource_type,
+                                              self.resource_name,
+                                              self.api_version)
+        return resource
+
+    def delete(self):
+        if self.resource_id:
+            return self.rcf.resources.delete_by_id(self.resource_id, self.api_version)
+        else:
+            return self.rcf.resources.delete(self.resource_group_name,
+                                             self.resource_provider_namespace,
+                                             self.parent_resource_path or '',
+                                             self.resource_type,
+                                             self.resource_name,
+                                             self.api_version)
+
+    def tag(self, tags):
+        resource = self.get_resource()
+        # pylint: disable=no-member
+        parameters = GenericResource(
+            location=resource.location,
+            tags=tags,
+            plan=resource.plan,
+            properties=resource.properties,
+            kind=resource.kind,
+            managed_by=resource.managed_by,
+            sku=resource.sku,
+            identity=resource.identity)
+
+        if self.resource_id:
+            return self.rcf.resources.create_or_update_by_id(self.resource_id, self.api_version,
+                                                             parameters)
+        else:
+            return self.rcf.resources.create_or_update(
+                self.resource_group_name,
+                self.resource_provider_namespace,
+                self.parent_resource_path or '',
+                self.resource_type,
+                self.resource_name,
+                self.api_version,
+                parameters)
+
+    @staticmethod
+    def _resolve_api_version(rcf, resource_provider_namespace, parent_resource_path, resource_type):
+        provider = rcf.providers.get(resource_provider_namespace)
+
+        #If available, we will use parent resource's api-version
+        resource_type_str = (parent_resource_path.split('/')[0]
+                             if parent_resource_path else resource_type)
+
+        rt = [t for t in provider.resource_types
+              if t.resource_type.lower() == resource_type_str.lower()]
+        if not rt:
+            raise IncorrectUsageError('Resource type {} not found.'
+                                      .format(resource_type_str))
+        if len(rt) == 1 and rt[0].api_versions:
+            npv = [v for v in rt[0].api_versions if 'preview' not in v.lower()]
+            return npv[0] if npv else rt[0].api_versions[0]
+        else:
+            raise IncorrectUsageError(
+                'API version is required and could not be resolved for resource {}'
+                .format(resource_type))
+
+    @staticmethod
+    def _resolve_api_version_by_id(rcf, resource_id):
+        parts = parse_resource_id(resource_id)
+        if parts.get('grandchild_type'):
+            parent = (parts['type'] + '/' +  parts['name'] + '/' +
+                      parts['child_type'] + '/' + parts['child_name'])
+            resource_type = parts['grandchild_type']
+        elif parts.get('child_type'):
+            parent = parts['type'] + '/' +  parts['name']
+            resource_type = parts['child_type']
+        else:
+            parent = None
+            resource_type = parts['type']
+
+        return _ResourceUtils._resolve_api_version(rcf, parts['namespace'], parent, resource_type)

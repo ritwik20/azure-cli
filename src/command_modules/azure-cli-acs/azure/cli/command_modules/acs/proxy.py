@@ -1,22 +1,19 @@
-#---------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License. See License.txt in the project root for license information.
-#---------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------
 
 import platform
 import subprocess
 from abc import abstractmethod
 
-try:
-    from azure.cli.command_modules.acs.win_proxy import WinProxy
-except ImportError:
-    pass
 
 def disable_http_proxy():
     """
     Disables the HTTP proxy
     """
     _get_proxy_instance().disable_http_proxy()
+
 
 def set_http_proxy(host, port):
     """
@@ -30,6 +27,7 @@ def set_http_proxy(host, port):
 
     _get_proxy_instance().set_http_proxy(host, port)
 
+
 def _get_proxy_instance():
     """
     Gets the proxy class instance based on the OS
@@ -38,16 +36,19 @@ def _get_proxy_instance():
     if os_platform == 'Darwin':
         return MacProxy()
     elif os_platform == 'Windows':
+        from azure.cli.command_modules.acs.win_proxy import WinProxy
         return WinProxy()
     elif os_platform == 'Linux':
         return LinuxProxy()
     else:
         raise NotImplementedError('Not implemented yet for {}'.format(os_platform))
 
+
 class Proxy(object):
     """
     Base proxy class
     """
+
     def __init__(self):
         pass
 
@@ -64,6 +65,7 @@ class Proxy(object):
         Disables the HTTP proxy
         """
         pass
+
 
 class LinuxProxy(Proxy):
     def __init__(self):
@@ -84,6 +86,7 @@ class LinuxProxy(Proxy):
         Disables the HTTP proxy
         """
         subprocess.call('sudo gsettings set org.gnome.system.proxy mode \'none\'', shell=True)
+
 
 class MacProxy(Proxy):
     def __init__(self):

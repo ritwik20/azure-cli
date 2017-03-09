@@ -1,17 +1,17 @@
 #!/usr/bin/env python
 
-#---------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License. See License.txt in the project root for license information.
-#---------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------
 
 from codecs import open
 from setuptools import setup
 
-VERSION = '0.1.0b8'
+VERSION = '2.0.0+dev'
 
 CLASSIFIERS = [
-    'Development Status :: 4 - Beta',
+    'Development Status :: 5 - Production/Stable',
     'Intended Audience :: Developers',
     'Intended Audience :: System Administrators',
     'Programming Language :: Python',
@@ -20,24 +20,32 @@ CLASSIFIERS = [
     'Programming Language :: Python :: 3',
     'Programming Language :: Python :: 3.4',
     'Programming Language :: Python :: 3.5',
+    'Programming Language :: Python :: 3.6',
     'License :: OSI Approved :: MIT License',
 ]
 
 DEPENDENCIES = [
-    'azure-mgmt-compute==0.30.0rc6',
+    'azure-mgmt-authorization==0.30.0rc6',
+    'azure-mgmt-compute==0.33.1rc1',
+    'azure-graphrbac==0.30.0rc6',
+    'azure-cli-core',
     'paramiko',
     'pyyaml',
+    'six',
+    'scp',
     'sshtunnel'
 ]
 
 with open('README.rst', 'r', encoding='utf-8') as f:
     README = f.read()
+with open('HISTORY.rst', 'r', encoding='utf-8') as f:
+    HISTORY = f.read()
 
 setup(
     name='azure-cli-acs',
     version=VERSION,
     description='Microsoft Azure Command-Line Tools ACS Command Module',
-    long_description=README,
+    long_description=README + '\n\n' + HISTORY,
     license='MIT',
     author='Microsoft Corporation',
     author_email='azpycli@microsoft.com',
@@ -50,6 +58,10 @@ setup(
     ],
     packages=[
         'azure.cli.command_modules.acs',
+        'azure.cli.command_modules.acs.mgmt_acs',
+        'azure.cli.command_modules.acs.mgmt_acs.lib',
+        'azure.cli.command_modules.acs.mgmt_acs.lib.models',
+        'azure.cli.command_modules.acs.mgmt_acs.lib.operations',
     ],
     install_requires=DEPENDENCIES,
 )

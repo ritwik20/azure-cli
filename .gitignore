@@ -5,6 +5,7 @@ __pycache__/
 # Virtual environment
 env/
 env27/
+.python-version
 
 # PTVS analysis
 .ptvs/
@@ -57,6 +58,9 @@ src/build
 /doc/sphinx/_build
 /.vs/config/applicationhost.config
 .vscode/settings.json
+.vscode/.ropeproject/
+.project
+.pydevproject
 
 # Azure deployment credentials
 *.pubxml
@@ -64,6 +68,12 @@ src/build
 # Auxiliary files
 command_coverage.txt
 
-#Test artifacts
+# Test artifacts
 private_config.json
 scripts/smart_create_gen/config.ini
+debug.log
+test_results/
+resources/
+
+# Code coverage
+.coverage

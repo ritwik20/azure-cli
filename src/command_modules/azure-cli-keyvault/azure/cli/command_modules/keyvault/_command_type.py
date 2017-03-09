@@ -1,26 +1,22 @@
-#---------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License. See License.txt in the project root for license information.
-#---------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------
 
 import base64
+from six import string_types
 
-from msrest.paging import Paged
-from msrest.exceptions import ValidationError
-from msrestazure.azure_operation import AzureOperationPoller
+import adal
 
-from azure.cli.core.commands import command_table, CliCommand, LongRunningOperation
+from azure.cli.core.commands import (command_table,
+                                     command_module_map,
+                                     CliCommand,
+                                     LongRunningOperation,
+                                     get_op_handler)
 from azure.cli.core.commands._introspection import \
     (extract_full_summary_from_signature, extract_args_from_signature)
-from azure.cli.core._profile import Profile
-from azure.cli.core._util import CLIError
 
-from azure.cli.command_modules.keyvault.keyvaultclient import \
-    (KeyVaultClient, KeyVaultAuthentication)
-from azure.cli.command_modules.keyvault.keyvaultclient.generated import \
-    (KeyVaultClient as BaseKeyVaultClient)
-from azure.cli.command_modules.keyvault.keyvaultclient.generated.models import \
-    (KeyVaultErrorException)
+from azure.cli.core._util import CLIError
 
 def _encode_hex(item):
     """ Recursively crawls the object structure and converts bytes or bytearrays to base64
@@ -40,22 +36,45 @@ def _encode_hex(item):
     else:
         return item
 
-def _create_key_vault_command(name, operation, transform_result, table_transformer):
+def _create_key_vault_command(module_name, name, operation, transform_result, table_transformer):
+
+    if not isinstance(operation, string_types):
+        raise ValueError("Operation must be a string. Got '{}'".format(operation))
 
     def _execute_command(kwargs):
+        from msrest.paging import Paged
+        from msrest.exceptions import ValidationError, ClientRequestError
+        from msrestazure.azure_operation import AzureOperationPoller
+        from azure.cli.core._profile import Profile
+        from azure.keyvault import \
+            (KeyVaultClient, KeyVaultAuthentication)
+        from azure.keyvault.generated import \
+            (KeyVaultClient as BaseKeyVaultClient)
+        from azure.keyvault.generated.models import \
+            (KeyVaultErrorException)
 
         try:
 
             def get_token(server, resource, scope): # pylint: disable=unused-argument
-                return Profile().get_login_credentials(resource)[0]._token_retriever() # pylint: disable=protected-access
+                try:
+                    return Profile().get_login_credentials(resource)[0]._token_retriever() # pylint: disable=protected-access
+                except adal.AdalError as err:
+                    #pylint: disable=no-member
+                    if (hasattr(err, 'error_response') and
+                            ('error_description' in err.error_response)
+                            and ('AADSTS70008:' in err.error_response['error_description'])):
+                        raise CLIError(
+                            "Credentials have expired due to inactivity. Please run 'az login'")
+                    raise CLIError(err)
 
+            op = get_op_handler(operation)
             # since the convenience client can be inconvenient, we have to check and create the
             # correct client version
-            if 'generated' in operation.__module__:
+            if 'generated' in op.__module__:
                 client = BaseKeyVaultClient(KeyVaultAuthentication(get_token))
             else:
                 client = KeyVaultClient(KeyVaultAuthentication(get_token)) # pylint: disable=redefined-variable-type
-            result = operation(client, **kwargs)
+            result = op(client, **kwargs)
 
             # apply results transform if specified
             if transform_result:
@@ -78,16 +97,24 @@ def _create_key_vault_command(name, operation, transform_result, table_transform
                 raise CLIError(ex.inner_exception.error.message)
             except AttributeError:
                 raise CLIError(ex)
+        except ClientRequestError as ex:
+            if 'Failed to establish a new connection' in str(ex.inner_exception):
+                raise CLIError('Max retries exceeded attempting to connect to vault. '
+                               'The vault may not exist or you may need to flush your DNS cache '
+                               'and try again later.')
+            raise CLIError(ex)
 
+    command_module_map[name] = module_name
     name = ' '.join(name.split())
-    cmd = CliCommand(name, _execute_command, table_transformer=table_transformer)
-    cmd.description = extract_full_summary_from_signature(operation)
-    cmd.arguments.update(extract_args_from_signature(operation))
+    arguments_loader = lambda: extract_args_from_signature(get_op_handler(operation))
+    description_loader = lambda: extract_full_summary_from_signature(get_op_handler(operation))
+    cmd = CliCommand(name, _execute_command, table_transformer=table_transformer,
+                     arguments_loader=arguments_loader, description_loader=description_loader)
     return cmd
 
 def cli_keyvault_data_plane_command(
         name, operation, transform=None, table_transformer=None):
     """ Registers an Azure CLI KeyVault Data Plane command. These commands must respond to a
     challenge from the service when they make requests. """
-    command = _create_key_vault_command(name, operation, transform, table_transformer)
+    command = _create_key_vault_command(__name__, name, operation, transform, table_transformer)
     command_table[command.name] = command

@@ -1,7 +1,7 @@
-﻿#---------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License. See License.txt in the project root for license information.
-#---------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------
 import datetime
 import json
 import re
@@ -11,16 +11,10 @@ from dateutil.relativedelta import relativedelta
 import dateutil.parser
 
 from azure.cli.core._util import CLIError, todict, get_file_json
-import azure.cli.core._logging as _logging
-from azure.cli.core.help_files import helps
+import azure.cli.core.azlogging as azlogging
 
-from azure.cli.core.commands.client_factory import (get_mgmt_service_client,
-                                                    configure_common_settings)
-
-from azure.mgmt.authorization import AuthorizationManagementClient
 from azure.mgmt.authorization.models import (RoleAssignmentProperties, Permission, RoleDefinition,
                                              RoleDefinitionProperties)
-from azure.graphrbac import GraphRbacManagementClient
 
 from azure.graphrbac.models import (ApplicationCreateParameters,
                                     ApplicationUpdateParameters,
@@ -30,29 +24,11 @@ from azure.graphrbac.models import (ApplicationCreateParameters,
                                     PasswordProfile,
                                     ServicePrincipalCreateParameters)
 
-logger = _logging.get_az_logger(__name__)
+from ._client_factory import _auth_client_factory, _graph_client_factory
 
+logger = azlogging.get_az_logger(__name__)
 
 _CUSTOM_RULE = 'CustomRole'
-
-def _auth_client_factory(scope=None):
-    subscription_id = None
-    if scope:
-        matched = re.match('/subscriptions/(?P<subscription>[^/]*)/', scope)
-        if matched:
-            subscription_id = matched.groupdict()['subscription']
-    return get_mgmt_service_client(AuthorizationManagementClient, subscription_id=subscription_id)
-
-def _graph_client_factory(**_):
-    from azure.cli.core._profile import Profile, CLOUD
-    profile = Profile()
-    cred, _, tenant_id = profile.get_login_credentials(
-        resource=CLOUD.endpoints.active_directory_graph_resource_id)
-    client = GraphRbacManagementClient(cred,
-                                       tenant_id,
-                                       base_url=CLOUD.endpoints.active_directory_graph_resource_id)
-    configure_common_settings(client)
-    return client
 
 def list_role_definitions(name=None, resource_group_name=None, scope=None,
                           custom_role_only=False):
@@ -65,34 +41,6 @@ def get_role_definition_name_completion_list(prefix, **kwargs):#pylint: disable=
     definitions = list_role_definitions()
     return [x.properties.role_name for x in list(definitions)]
 
-helps['role definition create'] = """
-            type: command
-            parameters: 
-                - name: --role-definition
-                  type: string
-                  short-summary: 'JSON formatted string or a path to a file with such content'
-            examples:
-                - name: Create a role with following definition content
-                  text: |
-                        {
-                            "Name": "Contoso On-call",
-                            "Description": "Can monitor compute, network and storage, and restart virtual machines",
-                            "Actions": [
-                                "Microsoft.Compute/*/read",
-                                "Microsoft.Compute/virtualMachines/start/action",
-                                "Microsoft.Compute/virtualMachines/restart/action",
-                                "Microsoft.Network/*/read",
-                                "Microsoft.Storage/*/read",
-                                "Microsoft.Authorization/*/read",
-                                "Microsoft.Resources/subscriptions/resourceGroups/read",
-                                "Microsoft.Resources/subscriptions/resourceGroups/resources/read",
-                                "Microsoft.Insights/alertRules/*",
-                                "Microsoft.Support/*"
-                            ],
-                            "AssignableScopes": ["/subscriptions/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"]
-                        }
-
-            """
 def create_role_definition(role_definition):
     role_id = uuid.uuid4()
     if os.path.exists(role_definition):
@@ -145,8 +93,8 @@ def _search_role_definitions(definitions_client, name, scope, custom_role_only=F
 def create_role_assignment(role, assignee, resource_group_name=None, scope=None):
     return _create_role_assignment(role, assignee, resource_group_name, scope)
 
-def _create_role_assignment(role, assignee, resource_group_name=None, scope=None,
-                            ocp_aad_session_key=None):
+def _create_role_assignment(role, assignee, resource_group_name=None, scope=None, #pylint: disable=too-many-arguments
+                            resolve_assignee=True):
     factory = _auth_client_factory(scope)
     assignments_client = factory.role_assignments
     definitions_client = factory.role_definitions
@@ -155,13 +103,10 @@ def _create_role_assignment(role, assignee, resource_group_name=None, scope=None
                               assignments_client.config.subscription_id)
 
     role_id = _resolve_role_id(role, scope, definitions_client)
-    object_id = _resolve_object_id(assignee)
+    object_id = _resolve_object_id(assignee) if resolve_assignee else assignee
     properties = RoleAssignmentProperties(role_id, object_id)
     assignment_name = uuid.uuid4()
     custom_headers = None
-    if ocp_aad_session_key:
-        custom_headers = {'ocp-aad-session-key': ocp_aad_session_key}
-
     return assignments_client.create(scope, assignment_name, properties,
                                      custom_headers=custom_headers)
 
@@ -426,7 +371,7 @@ def _build_application_creds(password=None, key_value=None, key_type=None,#pylin
         raise CLIError('specify either --password or --key-value, but not both.')
 
     if not start_date:
-        start_date = datetime.datetime.now()
+        start_date = datetime.datetime.utcnow()
     elif isinstance(start_date, str):
         start_date = dateutil.parser.parse(start_date)
 
@@ -451,21 +396,24 @@ def _build_application_creds(password=None, key_value=None, key_type=None,#pylin
 def create_service_principal(identifier):
     return _create_service_principal(identifier)
 
-def _create_service_principal(identifier, retain_raw_response=False):
+def _create_service_principal(identifier, resolve_app=True):
     client = _graph_client_factory()
-    try:
-        uuid.UUID(identifier)
-        result = list(client.applications.list(filter="appId eq '{}'".format(identifier)))
-    except ValueError:
-        result = list(client.applications.list(
-            filter="identifierUris/any(s:s eq '{}')".format(identifier)))
 
-    if not result: #assume we get an object id
-        result = [client.applications.get(identifier)]
-    app_id = result[0].app_id
+    if resolve_app:
+        try:
+            uuid.UUID(identifier)
+            result = list(client.applications.list(filter="appId eq '{}'".format(identifier)))
+        except ValueError:
+            result = list(client.applications.list(
+                filter="identifierUris/any(s:s eq '{}')".format(identifier)))
 
-    return client.service_principals.create(ServicePrincipalCreateParameters(app_id, True),
-                                            raw=retain_raw_response)
+        if not result: #assume we get an object id
+            result = [client.applications.get(identifier)]
+        app_id = result[0].app_id
+    else:
+        app_id = identifier
+
+    return client.service_principals.create(ServicePrincipalCreateParameters(app_id, True))
 
 def show_service_principal(client, identifier):
     object_id = _resolve_service_principal(client, identifier)
@@ -486,90 +434,140 @@ def _resolve_service_principal(client, identifier):
     except ValueError:
         raise CLIError("service principal '{}' doesn't exist".format(identifier))
 
-def create_service_principal_for_rbac(name=None, secret=None, years=1,
-                                      scopes=None, role=None):
-    '''create a service principal that can access or modify resources
-    :param str name: an unique uri. If missing, the command will generate one.
-    :param str secret: the secret used to login. If missing, command will generate one.
-    :param str years: Years the secret will be valid.
+def create_service_principal_for_rbac(name=None, password=None, years=1, #pylint:disable=too-many-arguments,too-many-statements,too-many-locals
+                                      scopes=None, role='Contributor', expanded_view=None,
+                                      skip_assignment=False):
+    '''create a service principal and configure its access to Azure resources
+    :param str name: a display name or an app id uri. Command will generate one if missing.
+    :param str password: the password used to login. If missing, command will generate one.
+    :param str years: Years the password will be valid.
     :param str scopes: space separated scopes the service principal's role assignment applies to.
-    :param str role: role the service principal has on the resources. only use with 'resource-ids'.
+           Defaults to the root of the current subscription.
+    :param str role: role the service principal has on the resources.
     '''
-    if bool(scopes) != bool(role):
-        raise CLIError("'--scopes' and '--role' must be used together.")
-    client = _graph_client_factory()
-    start_date = datetime.datetime.now()
-    app_display_name = 'azure-cli-' + start_date.strftime('%Y-%m-%d-%H-%M-%S')
+    import time
+    graph_client = _graph_client_factory()
+    role_client = _auth_client_factory().role_assignments
+    scopes = scopes or ['/subscriptions/' + role_client.config.subscription_id]
+    sp_oid = None
+    _RETRY_TIMES = 36
+
+    app_display_name = None
+    if name and not '://' in name:
+        app_display_name = name
+        name = "http://" + name #normalize be a valid graph service principal name
+
+    if name:
+        query_exp = 'servicePrincipalNames/any(x:x eq \'{}\')'.format(name)
+        aad_sps = list(graph_client.service_principals.list(filter=query_exp))
+        if aad_sps:
+            raise CLIError("'{}' already exists.".format(name))
+
+    #pylint: disable=protected-access
+
+    start_date = datetime.datetime.utcnow()
+    app_display_name = app_display_name or ('azure-cli-' +
+                                            start_date.strftime('%Y-%m-%d-%H-%M-%S'))
     if name is None:
         name = 'http://' + app_display_name # just a valid uri, no need to exist
 
     end_date = start_date + relativedelta(years=years)
-    secret = secret or str(uuid.uuid4())
-    aad_application = create_application(client.applications, display_name=app_display_name, #pylint: disable=too-many-function-args
+    password = password or str(uuid.uuid4())
+    aad_application = create_application(graph_client.applications,
+                                         display_name=app_display_name, #pylint: disable=too-many-function-args
                                          homepage='http://'+app_display_name,
                                          identifier_uris=[name],
                                          available_to_other_tenants=False,
-                                         password=secret,
+                                         password=password,
                                          start_date=start_date,
                                          end_date=end_date)
     #pylint: disable=no-member
-    aad_sp = _create_service_principal(aad_application.app_id, bool(scopes))
-    oid = aad_sp.output.object_id if scopes else aad_sp.object_id
+    app_id = aad_application.app_id
+    #retry till server replication is done
+    for l in range(0, _RETRY_TIMES):
+        try:
+            aad_sp = _create_service_principal(app_id, resolve_app=False)
+            break
+        except Exception as ex: #pylint: disable=broad-except
+            #pylint: disable=line-too-long
+            if l < _RETRY_TIMES and 'The appId of the service principal does not reference a valid application object' in str(ex):
+                time.sleep(5)
+                logger.warning('Retrying service principal creation: %s/%s', l+1, _RETRY_TIMES)
+            else:
+                logger.warning("Creating service principal failed for appid '%s'. Trace followed:\n%s",
+                               name, ex.response.headers if hasattr(ex, 'response') else ex) #pylint: disable=no-member
+                raise
+    sp_oid = aad_sp.object_id
 
-    if scopes:
-        #It is possible the SP has not been propagated to all servers, so creating assignments
-        #might fail. The reliable workaround is to call out the server where creation occurred.
-        #pylint: disable=protected-access
-        session_key = aad_sp.response.headers._store['ocp-aad-session-key'][1]
+    #retry while server replication is done
+    if not skip_assignment:
+        # pylint: disable=line-too-long
         for scope in scopes:
-            _create_role_assignment(role, oid, None, scope, ocp_aad_session_key=session_key)
+            for l in range(0, _RETRY_TIMES):
+                try:
+                    _create_role_assignment(role, sp_oid, None, scope, resolve_assignee=False)
+                    break
+                except Exception as ex:
+                    if l < _RETRY_TIMES and ' does not exist in the directory ' in str(ex):
+                        time.sleep(5)
+                        logger.warning('Retrying role assignment creation: %s/%s', l+1, _RETRY_TIMES)
+                        continue
+                    else:
+                        #dump out history for diagnoses
+                        logger.warning('Role assignment creation failed.\n')
+                        if getattr(ex, 'response', None) is not None:
+                            logger.warning('role assignment response headers: %s\n', ex.response.headers) #pylint: disable=no-member
+                    raise
 
-    return {
-        'client_id': aad_application.app_id,
-        'client_secret': secret,
-        'sp_name': name,
-        'tenant': client.config.tenant_id
-        }
+    if expanded_view:
+        from azure.cli.core._profile import Profile
+        profile = Profile()
+        result = profile.get_expanded_subscription_info(scopes[0].split('/')[2] if scopes else None,
+                                                        app_id, password)
+    else:
+        result = {
+            'appId': app_id,
+            'password': password,
+            'name': name,
+            'displayName': app_display_name,
+            'tenant': graph_client.config.tenant_id
+            }
+    return result
 
-def reset_service_principal_credential(name, secret=None, years=1):
+def reset_service_principal_credential(name, password=None, years=1):
     '''reset credential, on expiration or you forget it.
 
-    :param str name: the uri representing the name of the service principal
-    :param str secret: the secret used to login. If missing, command will generate one.
-    :param str years: Years the secret will be valid.
+    :param str name: the name, can be the app id uri, app id guid, or display name
+    :param str password: the password used to login. If missing, command will generate one.
+    :param str years: Years the password will be valid.
     '''
     client = _graph_client_factory()
 
     #pylint: disable=no-member
 
     #look for the existing application
-    query_exp = 'identifierUris/any(x:x eq \'{}\')'.format(name)
-    aad_apps = list(client.applications.list(filter=query_exp))
-    if not aad_apps:
-        raise CLIError('can\'t find an application matching \'{}\''.format(name))
-    #no need to check 2+ matches, as app id uri is unique
-    app = aad_apps[0]
-
-    #look for the existing service principal
-    query_exp = 'servicePrincipalNames/any(x:x eq \'{}\')'.format(name)
+    query_exp = "servicePrincipalNames/any(x:x eq \'{0}\') or displayName eq '{0}'".format(name)
     aad_sps = list(client.service_principals.list(filter=query_exp))
     if not aad_sps:
-        raise CLIError('can\'t find a service principal matching \'{}\''.format(name))
+        raise CLIError("can't find a service principal matching '{}'".format(name))
+    if len(aad_sps) > 1:
+        raise CLIError('more than one entry matches the name, please provide unique names like app id guid, or app id uri')#pylint: disable=line-too-long
+    app = show_application(client.applications, aad_sps[0].app_id)
 
     #build a new password credential and patch it
-    secret = secret or str(uuid.uuid4())
-    start_date = datetime.datetime.now()
+    password = password or str(uuid.uuid4())
+    start_date = datetime.datetime.utcnow()
     end_date = start_date + relativedelta(years=years)
     key_id = str(uuid.uuid4())
-    app_cred = PasswordCredential(start_date, end_date, key_id, secret)
+    app_cred = PasswordCredential(start_date, end_date, key_id, password)
     app_create_param = ApplicationUpdateParameters(password_credentials=[app_cred])
 
     client.applications.patch(app.object_id, app_create_param)
 
     return {
-        'client_id': app.app_id,
-        'client_secret': secret,
-        'sp_name': name,
+        'appId': app.app_id,
+        'password': password,
+        'name': name,
         'tenant': client.config.tenant_id
         }
 
